@@ -210,9 +210,23 @@ def build_mlp_compute_input(
     if fused_experts_input.quant.is_mxfp and fused_experts_input.quant.mxfp is None:
         raise ValueError("fused_experts_input.quant.mxfp is required when quant_type is QuantType.MXFP8.")
 
+    # When expert_weight_provider is used, the dispatch may produce a
+    # group_list with global_num_experts entries while the weights only
+    # have capacity entries.  Truncate the group_list to match the actual
+    # number of weight experts so that npu_grouped_matmul (groupType=0)
+    # does not see a size mismatch.
+    group_list = token_dispatch_output.group_list
+    num_weight_experts = (
+        fused_experts_input.weights.w1[0].shape[0]
+        if isinstance(fused_experts_input.weights.w1, list)
+        else fused_experts_input.weights.w1.shape[0]
+    )
+    if group_list.shape[0] > num_weight_experts:
+        group_list = group_list[:num_weight_experts]
+
     return MoEMlpComputeInput(
         hidden_states=token_dispatch_output.hidden_states,
-        group_list=token_dispatch_output.group_list,
+        group_list=group_list,
         group_list_type=token_dispatch_output.group_list_type,
         dynamic_scale=token_dispatch_output.dynamic_scale,
         topk_scales=token_dispatch_output.topk_scales,

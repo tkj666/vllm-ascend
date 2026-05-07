@@ -279,6 +279,22 @@ class FusedMC2CommImpl(MoECommMethod):
 
         expert_tokens = None
         if envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 1:
+            # When expert_weight_provider is used, the weight list may contain
+            # fewer experts (capacity) than num_local_experts.  Dynamically
+            # size expert_token_nums to match the actual weight count so that
+            # the C++ operator does not write out-of-bounds.
+            num_experts_in_weight = (
+                fused_experts_input.weights.w1[0].shape[0]
+                if isinstance(fused_experts_input.weights.w1, list)
+                else fused_experts_input.weights.w1.shape[0]
+            )
+            if num_experts_in_weight != self.moe_config.num_local_experts:
+                expert_token_nums = torch.zeros(
+                    [num_experts_in_weight], dtype=torch.int32, device="npu"
+                )
+            else:
+                expert_token_nums = self.expert_token_nums
+
             out = torch.empty_like(fused_experts_input.hidden_states)
             torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
                 x=fused_experts_input.hidden_states,
@@ -291,9 +307,9 @@ class FusedMC2CommImpl(MoECommMethod):
                 group=self.token_dispatcher.moe_all_to_all_group_name,
                 max_output_size=65536,
                 out=out,
-                expert_token_nums=self.expert_token_nums,
+                expert_token_nums=expert_token_nums,
             )
-            expert_tokens = self.expert_token_nums
+            expert_tokens = expert_token_nums
         elif envs_ascend.VLLM_ASCEND_ENABLE_FUSED_MC2 == 2:
             assert fused_experts_input.routing.expert_map is not None, "expert_map cannot be None."
             out, expert_tokens = torch.ops._C_ascend.dispatch_gmm_combine_decode(  # type: ignore

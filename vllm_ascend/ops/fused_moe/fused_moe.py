@@ -94,6 +94,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
             layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
 
+        layer._maybe_init_expert_lru_cache()
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -160,51 +162,167 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
         moe_comm_method = _EXTRA_CTX.moe_comm_method
-        # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
-        # and provide dummy scales (w1_scale, w2_scale). This is required because:
-        # The underlying Ascend fused operator (e.g., dispatch_ffn_combine) expects
-        # inputs in a list format.
-        # TODO: Passing an empty tensor as scale for float (BF16) cases is semantically
-        # incorrect. The ideal solution is to pass None. However, if the underlying
-        # dispatch_ffn_combine C++ operator does not support None for the scale argument
-        # (due to signature constraints), we are forced to use a placeholder empty tensor.
-        # This TODO tracks the requirement to update the C++ operator to accept Optional[Tensor]
-        # or None for scales in non-quantized scenarios.
-        if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
-            w1 = [layer.w13_weight]
-            w1_scale = [torch.tensor([], dtype=torch.int64)]
-            w2 = [layer.w2_weight]
-            w2_scale = [torch.tensor([], dtype=torch.int64)]
-        else:
-            w1 = layer.w13_weight
-            w1_scale = None
-            w2 = layer.w2_weight
-            w2_scale = None
+        
+        provider = getattr(layer, "expert_weight_provider", None)
+        if provider is not None:
+            final_output = None
+            for result in provider.prepare(topk_ids):
+                expert_map = result.expert_map if result.expert_map is not None else expert_map
 
-        final_hidden_states = moe_comm_method.fused_experts(
-            fused_experts_input=build_fused_experts_input(
-                hidden_states=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                w1=w1,
-                w2=w2,
-                w1_bias=layer.w13_bias if self.moe.has_bias else None,
-                w2_bias=layer.w2_bias if self.moe.has_bias else None,
-                quant_type=QuantType.NONE,
-                dynamic_eplb=self.dynamic_eplb,
-                expert_map=expert_map,
-                global_redundant_expert_num=global_redundant_expert_num,
-                mc2_mask=mc2_mask,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                log2phy=log2phy,
-                pertoken_scale=pertoken_scale,
-                activation=activation,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
+                # When the provider yields a per-chunk expert_map, the topk_ids
+                # returned by the provider are already remapped to buffer slot
+                # indices.  The original log2phy (which maps global expert ID →
+                # physical expert index) is not valid for buffer slot indices.
+                #
+                # The handling differs by communication type:
+                # - FusedMC2: the C++ fused operator expects buffer slot indices
+                #   as expert_idx.  Derive a log2phy that treats buffer slots as
+                #   local EP experts (slot + ep_rank * num_local_experts) so
+                #   tokens stay on the current rank.
+                # - AllGather / AlltoAll: use buffer slot topk_ids directly
+                #   with expert_map=None so that the dispatch does not apply
+                #   EP-aware active_expert_range filtering.  The provider's
+                #   token_indices already select the correct tokens per chunk;
+                #   re-filtering with EP ranges would silently drop tokens
+                #   whose global expert IDs fall outside the EP shard.
+                is_fused_mc2 = _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
+                if result.expert_map is not None:
+                    if is_fused_mc2:
+                        # FusedMC2: keep buffer slot indices, derive EP log2phy
+                        if log2phy is not None:
+                            capacity = result.w1.shape[0]
+                            chunk_log2phy = torch.arange(
+                                capacity, dtype=torch.int32, device=result.expert_map.device
+                            )
+                            chunk_log2phy = chunk_log2phy + layer.ep_rank * layer.local_num_experts
+                        else:
+                            chunk_log2phy = None
+                        ids_chunk = result.topk_ids
+                    else:
+                        # AllGather / AlltoAll: use buffer slots directly,
+                        # skip EP expert_map filtering (token_indices handles it).
+                        chunk_log2phy = None
+                        ids_chunk = result.topk_ids
+                        expert_map = None
+                else:
+                    chunk_log2phy = log2phy
+                    ids_chunk = result.topk_ids
+
+                # Prepare inputs.  Buffer-slot ids may contain -1 sentinels
+                # for experts not in this chunk; clamp them to 0 and zero the
+                # corresponding weights.
+                if result.token_indices is not None:
+                    x_chunk = x[result.token_indices]
+                    w_chunk = topk_weights[result.token_indices].clone()
+                    sentinel_mask = ids_chunk == -1
+                    w_chunk[sentinel_mask] = 0.0
+                    ids_chunk = ids_chunk.clamp(min=0)
+                else:
+                    x_chunk = x
+                    w_chunk = topk_weights
+
+                # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
+                # and provide dummy scales (w1_scale, w2_scale). This is required because:
+                # The underlying Ascend fused operator (e.g., dispatch_ffn_combine) expects
+                # inputs in a list format.
+                # TODO: Passing an empty tensor as scale for float (BF16) cases is semantically
+                # incorrect. The ideal solution is to pass None. However, if the underlying
+                # dispatch_ffn_combine C++ operator does not support None for the scale argument
+                # (due to signature constraints), we are forced to use a placeholder empty tensor.
+                # This TODO tracks the requirement to update the C++ operator to accept Optional[Tensor]
+                # or None for scales in non-quantized scenarios.
+                if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+                    w1 = [result.w1]
+                    w1_scale = [torch.tensor([], dtype=torch.int64)]
+                    w2 = [result.w2]
+                    w2_scale = [torch.tensor([], dtype=torch.int64)]
+                else:
+                    w1 = result.w1
+                    w1_scale = None
+                    w2 = result.w2
+                    w2_scale = None
+
+                chunk_hidden_states = moe_comm_method.fused_experts(
+                    fused_experts_input=build_fused_experts_input(
+                        hidden_states=x_chunk,
+                        topk_weights=w_chunk,
+                        topk_ids=ids_chunk,
+                        w1=w1,
+                        w2=w2,
+                        w1_bias=layer.w13_bias if self.moe.has_bias else None,
+                        w2_bias=layer.w2_bias if self.moe.has_bias else None,
+                        quant_type=QuantType.NONE,
+                        dynamic_eplb=self.dynamic_eplb,
+                        expert_map=expert_map,
+                        global_redundant_expert_num=global_redundant_expert_num,
+                        mc2_mask=mc2_mask,
+                        apply_router_weight_on_input=apply_router_weight_on_input,
+                        log2phy=chunk_log2phy,
+                        pertoken_scale=pertoken_scale,
+                        activation=activation,
+                        w1_scale=w1_scale,
+                        w2_scale=w2_scale,
+                    )
+                )
+                if result.token_indices is not None:
+                    if final_output is None:
+                        final_output = torch.zeros_like(x)
+                    final_output[result.token_indices] += chunk_hidden_states.routed_out
+                else:
+                    final_hidden_states = chunk_hidden_states
+
+            # After the provider loop, if we accumulated into final_output
+            # (EP-style chunking), wrap it as the final result.
+            if final_output is not None:
+                final_hidden_states = FusedExpertsResult(routed_out=final_output)
+
+        else:
+            # NOTE: In the MoECommType.FUSED_MC2 branch, we wrap weights (w1, w2) into lists
+            # and provide dummy scales (w1_scale, w2_scale). This is required because:
+            # The underlying Ascend fused operator (e.g., dispatch_ffn_combine) expects
+            # inputs in a list format.
+            # TODO: Passing an empty tensor as scale for float (BF16) cases is semantically
+            # incorrect. The ideal solution is to pass None. However, if the underlying
+            # dispatch_ffn_combine C++ operator does not support None for the scale argument
+            # (due to signature constraints), we are forced to use a placeholder empty tensor.
+            # This TODO tracks the requirement to update the C++ operator to accept Optional[Tensor]
+            # or None for scales in non-quantized scenarios.
+            if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+                w1 = [layer.w13_weight]
+                w1_scale = [torch.tensor([], dtype=torch.int64)]
+                w2 = [layer.w2_weight]
+                w2_scale = [torch.tensor([], dtype=torch.int64)]
+            else:
+                w1 = layer.w13_weight
+                w1_scale = None
+                w2 = layer.w2_weight
+                w2_scale = None
+
+            final_hidden_states = moe_comm_method.fused_experts(
+                fused_experts_input=build_fused_experts_input(
+                    hidden_states=x,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    w1=w1,
+                    w2=w2,
+                    w1_bias=layer.w13_bias if self.moe.has_bias else None,
+                    w2_bias=layer.w2_bias if self.moe.has_bias else None,
+                    quant_type=QuantType.NONE,
+                    dynamic_eplb=self.dynamic_eplb,
+                    expert_map=expert_map,
+                    global_redundant_expert_num=global_redundant_expert_num,
+                    mc2_mask=mc2_mask,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    log2phy=log2phy,
+                    pertoken_scale=pertoken_scale,
+                    activation=activation,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                )
             )
-        )
+
         if zero_expert_num > 0 and zero_expert_type is not None:
-            final_hidden_states += zero_expert_result
+            final_hidden_states.routed_out += zero_expert_result
         return final_hidden_states
 
 
